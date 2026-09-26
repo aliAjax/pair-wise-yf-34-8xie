@@ -1,3 +1,18 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}.inv{border-left:4px solid #4338ca;padding:8px 12px;margin:8px 0;background:#f8fafc}.inv.open{border-color:#dc2626}.inv h3{margin:4px 0;font-size:15px}.inv p{margin:4px 0;color:#475569}</style>
+<h1>无人机空域协调台</h1><p>查看飞行计划、当前空域限制与调查封存。提交、审核、变更和紧急授权通过 JSON API 完成。</p>
+<section>身份 <input id="u" value="reviewer"><input id="r" value="airspace_reviewer">运营方 <input id="op" value=""><button onclick="load()">刷新</button><pre id="o"></pre></section>
+<section><h2>调查封存</h2><div id="inv"></div></section>
+<script>
+function hdrs(){let h={'X-User-Id':u.value,'X-Role':r.value};if(op.value)h['X-Operator']=op.value;return h}
+async function load(){
+  let x=await fetch('/api/state',{headers:hdrs()});o.textContent=JSON.stringify(await x.json(),null,2)
+  let y=await fetch('/api/investigations',{headers:hdrs()});let d=await y.json()
+  inv.innerHTML=(d.investigations||[]).map(i=>{let s=i.snapshot_summary
+    return `<div class="inv ${i.status}"><h3>#${i.id} 计划 ${i.plan_id} · ${i.status==='open'?'封存中':'已解除'} · 事故类型：${i.incident_type}</h3>
+    <p>发现时间：${i.discovered_at} · 开单人：${i.opened_by} · 冻结原因：${i.reason}</p>
+    <p>快照摘要：计划状态 ${s.plan_status} / 版本 ${s.plan_revision} · 审核记录 ${s.approvals} 条 · 通知 ${s.notifications} 条 · 硬约束违规 ${s.hard_violations} 项 · 阻断冲突 ${s.blocking_conflicts} 项</p>
+    ${i.status==='closed'?`<p>结论：${i.conclusion}（${i.closed_by} 于 ${i.closed_at} 解除）</p>`:''}</div>`}).join('')||'<p>暂无调查单</p>'
+}
+load()
+</script>

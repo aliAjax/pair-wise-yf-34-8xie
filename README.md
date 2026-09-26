@@ -19,7 +19,10 @@ python3 app.py --db drone_airspace.db
 - `GET /api/plans/{id}/check`：检查硬约束和相邻交通冲突。
 - `POST /api/plans/{id}/submit`、`approve`、`reject`：提交和审核；审核使用 `offline_id` 保证断网重连幂等。
 - `POST /api/plans/{id}/change`、`cancel`：版本化变更与取消，并生成通知。
-- `GET /api/notifications`、`POST /api/expire`：通知与到期处理。
+- `POST /api/plans/{id}/investigate`：指挥官开立调查封存，登记事故类型与发现时间，并固定计划、审核、通知和限制检查快照；封存期间计划状态改写一律返回 409，运营方只读。
+- `POST /api/investigations/{id}/close`：原开单人填写结论解除封存；若封存后出现新禁飞区，原批准失效并退回草稿。
+- `GET /api/investigations`、`/api/investigations/{id}`：调查清单（含冻结原因与快照摘要）与完整快照。
+- `GET /api/notifications`、`POST /api/expire`：通知与到期处理（封存中的计划不参与到期处理）。
 - `GET /api/state`：按角色返回计划、限制和公开信息。
 
 ## 测试

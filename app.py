@@ -85,6 +85,12 @@ class Repository:
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL,
             detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS investigations(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id),
+            incident_type TEXT NOT NULL, discovered_at TEXT NOT NULL, reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open', opened_by TEXT NOT NULL, opened_at TEXT NOT NULL,
+            closed_by TEXT, closed_at TEXT, conclusion TEXT, snapshot_json TEXT NOT NULL
+        );
         """)
 
     @contextmanager
@@ -101,6 +107,29 @@ class Repository:
     @staticmethod
     def notify(conn: sqlite3.Connection, plan_id: int, kind: str, message: str) -> None:
         conn.execute("INSERT INTO notifications(plan_id,kind,message,created_at) VALUES(?,?,?,?)", (plan_id, kind, message, iso()))
+
+    @staticmethod
+    def active_investigation(conn: sqlite3.Connection, plan_id: int) -> sqlite3.Row | None:
+        return conn.execute("SELECT * FROM investigations WHERE plan_id=? AND status='open' ORDER BY id DESC", (plan_id,)).fetchone()
+
+    @staticmethod
+    def insert_investigation(conn: sqlite3.Connection, plan_id: int, incident_type: str, discovered_at: str, reason: str, opened_by: str, snapshot: dict[str, Any]) -> int:
+        cur = conn.execute("""INSERT INTO investigations(plan_id,incident_type,discovered_at,reason,opened_by,opened_at,snapshot_json)
+                              VALUES(?,?,?,?,?,?,?)""", (plan_id, incident_type, discovered_at, reason, opened_by, iso(), json.dumps(snapshot, ensure_ascii=False, sort_keys=True)))
+        return int(cur.lastrowid)
+
+    @staticmethod
+    def investigation_row(conn: sqlite3.Connection, investigation_id: int) -> sqlite3.Row | None:
+        return conn.execute("SELECT * FROM investigations WHERE id=?", (investigation_id,)).fetchone()
+
+    @staticmethod
+    def close_investigation(conn: sqlite3.Connection, investigation_id: int, actor: str, conclusion: str) -> None:
+        conn.execute("UPDATE investigations SET status='closed',closed_by=?,closed_at=?,conclusion=? WHERE id=?", (actor, iso(), conclusion, investigation_id))
+
+    @staticmethod
+    def list_investigations(conn: sqlite3.Connection, operator: str | None = None) -> list[sqlite3.Row]:
+        if operator is None: return list(conn.execute("SELECT * FROM investigations ORDER BY id DESC"))
+        return list(conn.execute("""SELECT i.* FROM investigations i JOIN flight_plans p ON p.id=i.plan_id WHERE p.operator_id=? ORDER BY i.id DESC""", (operator,)))
 
 
 class DroneAirspaceService:
@@ -168,6 +197,13 @@ class DroneAirspaceService:
             if role not in {"operator", "airspace_reviewer", "commander", "auditor", "viewer"}: raise ApiError(403, "check_forbidden", "无权检查冲突")
             return self._conflict_report(conn, plan)
 
+    @staticmethod
+    def _restriction_hit(plan_altitude: float, bbox: tuple[float, float, float, float], start: datetime, end: datetime, restriction: sqlite3.Row) -> bool:
+        rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
+        if not boxes_overlap(bbox, rbox): return False
+        if not times_overlap(start, end, parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): return False
+        return plan_altitude > restriction["min_altitude"] and restriction["max_altitude"] > 0
+
     def _conflict_report(self, conn: sqlite3.Connection, plan: sqlite3.Row) -> dict[str, Any]:
         route = self._route(plan); bbox = route_bbox(route); start, end = parse_time(plan["starts_at"]), parse_time(plan["ends_at"])
         hard: list[dict[str, Any]] = []; blocking: list[dict[str, Any]] = []
@@ -175,13 +211,9 @@ class DroneAirspaceService:
         if plan["max_altitude"] > 120: hard.append({"code": "altitude_limit", "message": "常规计划高度不得超过 120m"})
         if plan["population_risk"] > 3: blocking.append({"code": "population_risk", "risk": plan["population_risk"], "message": "人口风险超过常规批准阈值"})
         for restriction in conn.execute("SELECT * FROM restrictions WHERE status='active'"):
-            rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
-            if not boxes_overlap(bbox, rbox): continue
-            if not times_overlap(start, end, parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): continue
-            altitude_overlap = plan["max_altitude"] > restriction["min_altitude"] and restriction["max_altitude"] > 0
-            if altitude_overlap:
-                item = {"code": "airspace_restriction", "restriction_id": restriction["id"], "name": restriction["name"], "kind": restriction["kind"], "reason": restriction["reason"]}
-                blocking.append(item)
+            if not self._restriction_hit(plan["max_altitude"], bbox, start, end, restriction): continue
+            item = {"code": "airspace_restriction", "restriction_id": restriction["id"], "name": restriction["name"], "kind": restriction["kind"], "reason": restriction["reason"]}
+            blocking.append(item)
         adjacent: list[dict[str, Any]] = []
         for other in conn.execute("SELECT * FROM flight_plans WHERE id!=? AND status IN ('submitted','approved') AND starts_at<? AND ends_at>?", (plan["id"], iso(end), iso(start))):
             if boxes_overlap(bbox, route_bbox(self._route(other)), 0.002):
@@ -204,6 +236,7 @@ class DroneAirspaceService:
             plan = self._plan_row(conn, plan_id)
             if plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能提交其他运营方计划")
             if plan["status"] == "submitted": return {"plan": self.get_plan(plan_id, role, operator), "idempotent": True}
+            self._require_unfrozen(conn, plan_id)
             if plan["status"] not in {"draft", "rejected"}: raise ApiError(409, "invalid_transition", "当前状态不能提交")
             if parse_time(plan["starts_at"]) <= utcnow(): raise ApiError(409, "plan_expired", "计划起飞时间已过")
             conn.execute("UPDATE flight_plans SET status='submitted',updated_at=? WHERE id=?", (iso(), plan_id))
@@ -223,6 +256,7 @@ class DroneAirspaceService:
                 raise ApiError(409, "offline_id_conflict", "该离线审核编号已经用于其他决定")
             plan = self._plan_row(conn, plan_id)
             if plan["status"] == "approved": return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True}
+            self._require_unfrozen(conn, plan_id)
             if plan["status"] != "submitted": raise ApiError(409, "invalid_transition", "只有已提交计划可以批准")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化，审核决定不能套用")
             report = self._conflict_report(conn, plan)
@@ -248,6 +282,7 @@ class DroneAirspaceService:
                 if prior["plan_id"] == plan_id and prior["plan_revision"] == expected and prior["decision"] == "rejected": return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True}
                 raise ApiError(409, "offline_id_conflict", "该离线审核编号已经被使用")
             plan = self._plan_row(conn, plan_id)
+            self._require_unfrozen(conn, plan_id)
             if plan["status"] != "submitted" or plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划状态或版本不匹配")
             conn.execute("INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,created_at) VALUES(?,?,?,?,?,?,?)", (plan_id, expected, actor, "rejected", reason, offline_id, iso()))
             conn.execute("UPDATE flight_plans SET status='rejected',updated_at=? WHERE id=?", (iso(), plan_id))
@@ -262,6 +297,7 @@ class DroneAirspaceService:
         with self.repo.tx() as conn:
             plan = self._plan_row(conn, plan_id)
             if plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能修改其他运营方计划")
+            self._require_unfrozen(conn, plan_id)
             if plan["status"] in {"canceled", "expired"}: raise ApiError(409, "plan_closed", "已取消或过期计划不能修改")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化")
             route = validate_route(body.get("route", self._route(plan)))
@@ -286,11 +322,100 @@ class DroneAirspaceService:
             if role == "operator" and plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能取消其他运营方计划")
             if role not in {"operator", "airspace_reviewer", "commander"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消计划")
             if plan["status"] == "canceled": return {"plan": self.get_plan(plan_id, role, operator), "idempotent": True}
+            self._require_unfrozen(conn, plan_id)
             if plan["status"] == "expired": raise ApiError(409, "plan_expired", "已过期计划不能取消")
             conn.execute("UPDATE flight_plans SET status='canceled',updated_at=? WHERE id=?", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
             Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
+
+    @staticmethod
+    def _require_unfrozen(conn: sqlite3.Connection, plan_id: int) -> None:
+        inv = Repository.active_investigation(conn, plan_id)
+        if inv: raise ApiError(409, "plan_frozen", f"计划处于调查封存中（调查单 #{inv['id']}），解除前不能改写状态", {"investigation_id": inv["id"]})
+
+    def _investigation_snapshot(self, conn: sqlite3.Connection, plan: sqlite3.Row) -> dict[str, Any]:
+        plan_data = dict(plan); plan_data["route"] = json.loads(plan_data.pop("route_json")); plan_data["route_bbox"] = route_bbox(plan_data["route"])
+        return {
+            "plan": plan_data,
+            "approvals": [dict(r) for r in conn.execute("SELECT * FROM approvals WHERE plan_id=? ORDER BY id", (plan["id"],))],
+            "notifications": [dict(r) for r in conn.execute("SELECT * FROM notifications WHERE plan_id=? ORDER BY id", (plan["id"],))],
+            "conflict_report": self._conflict_report(conn, plan),
+            "active_restrictions": [dict(r) for r in conn.execute("SELECT * FROM restrictions WHERE status='active' ORDER BY id")],
+        }
+
+    @staticmethod
+    def _snapshot_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
+        report = snapshot["conflict_report"]
+        return {"plan_status": snapshot["plan"]["status"], "plan_revision": snapshot["plan"]["revision"],
+                "approvals": len(snapshot["approvals"]), "notifications": len(snapshot["notifications"]),
+                "hard_violations": len(report["hard_violations"]), "blocking_conflicts": len(report["blocking_conflicts"]), "approvable": report["approvable"]}
+
+    def _investigation_view(self, row: sqlite3.Row, full: bool = False) -> dict[str, Any]:
+        inv = dict(row); snapshot = json.loads(inv.pop("snapshot_json")); inv["snapshot_summary"] = self._snapshot_summary(snapshot)
+        if full: inv["snapshot"] = snapshot
+        return inv
+
+    def open_investigation(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "commander": raise ApiError(403, "investigation_forbidden", "只有指挥官可以开立调查封存")
+        incident_type, reason = str(body.get("incident_type", "")).strip(), str(body.get("reason", "")).strip()
+        if not incident_type or not reason: raise ApiError(400, "investigation_details_required", "事故类型和冻结原因必填")
+        discovered = parse_time(body.get("discovered_at"))
+        with self.repo.tx() as conn:
+            plan = self._plan_row(conn, plan_id)
+            if Repository.active_investigation(conn, plan_id): raise ApiError(409, "plan_frozen", "该计划已存在进行中的调查封存")
+            snapshot = self._investigation_snapshot(conn, plan)
+            inv_id = Repository.insert_investigation(conn, plan_id, incident_type, iso(discovered), reason, actor, snapshot)
+            Repository.audit(conn, plan_id, actor, role, "investigation_opened", {"investigation_id": inv_id, "incident_type": incident_type, "discovered_at": iso(discovered)})
+            Repository.notify(conn, plan_id, "investigation_opened", f"飞行计划 {plan['callsign']} 已进入调查封存：{reason}")
+            return self._investigation_view(Repository.investigation_row(conn, inv_id), full=True)
+
+    def _new_no_fly_conflicts(self, conn: sqlite3.Connection, plan: sqlite3.Row, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+        known = {r["id"] for r in snapshot["active_restrictions"]}
+        bbox = route_bbox(self._route(plan)); start, end = parse_time(plan["starts_at"]), parse_time(plan["ends_at"])
+        new: list[dict[str, Any]] = []
+        for restriction in conn.execute("SELECT * FROM restrictions WHERE status='active' AND kind='no_fly'"):
+            if restriction["id"] in known: continue
+            if self._restriction_hit(plan["max_altitude"], bbox, start, end, restriction):
+                new.append({"restriction_id": restriction["id"], "name": restriction["name"], "reason": restriction["reason"]})
+        return new
+
+    def close_investigation(self, investigation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "commander": raise ApiError(403, "investigation_forbidden", "只有指挥官可以解除调查封存")
+        conclusion = str(body.get("conclusion", "")).strip()
+        if not conclusion: raise ApiError(400, "conclusion_required", "解除封存必须填写调查结论")
+        with self.repo.tx() as conn:
+            inv = Repository.investigation_row(conn, investigation_id)
+            if not inv: raise ApiError(404, "investigation_not_found", "调查单不存在")
+            if inv["status"] != "open": raise ApiError(409, "investigation_closed", "调查单已解除，不能重复操作")
+            if inv["opened_by"] != actor: raise ApiError(403, "not_opener", "只有原开单人可以解除该封存")
+            plan = self._plan_row(conn, inv["plan_id"])
+            new_no_fly = self._new_no_fly_conflicts(conn, plan, json.loads(inv["snapshot_json"]))
+            Repository.close_investigation(conn, investigation_id, actor, conclusion)
+            invalidated = False
+            if new_no_fly and plan["status"] == "approved":
+                conn.execute("UPDATE flight_plans SET status='draft',updated_at=? WHERE id=?", (iso(), plan["id"])); invalidated = True
+                Repository.audit(conn, plan["id"], actor, role, "approval_invalidated", {"investigation_id": investigation_id, "new_no_fly": new_no_fly})
+                Repository.notify(conn, plan["id"], "approval_invalidated", f"飞行计划 {plan['callsign']} 解除封存后出现新禁飞区，原批准失效并退回草稿")
+            Repository.audit(conn, plan["id"], actor, role, "investigation_closed", {"investigation_id": investigation_id, "conclusion": conclusion, "new_no_fly": new_no_fly})
+            Repository.notify(conn, plan["id"], "investigation_closed", f"飞行计划 {plan['callsign']} 调查封存已解除：{conclusion}")
+            result = self._investigation_view(Repository.investigation_row(conn, investigation_id), full=True)
+            return {"investigation": result, "new_no_fly": new_no_fly, "approval_invalidated": invalidated}
+
+    def list_investigations(self, role: str, operator: str) -> dict[str, Any]:
+        if role in {"airspace_reviewer", "commander", "auditor"}: rows = Repository.list_investigations(self.repo.conn)
+        elif role == "operator": rows = Repository.list_investigations(self.repo.conn, operator)
+        else: raise ApiError(403, "investigations_forbidden", "当前角色不能读取调查清单")
+        return {"investigations": [self._investigation_view(r) for r in rows]}
+
+    def investigation_detail(self, investigation_id: int, role: str, operator: str) -> dict[str, Any]:
+        row = Repository.investigation_row(self.repo.conn, investigation_id)
+        if not row: raise ApiError(404, "investigation_not_found", "调查单不存在")
+        if role == "operator":
+            plan = self._plan_row(self.repo.conn, row["plan_id"])
+            if plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能查看其他运营方计划的调查单")
+        elif role not in {"airspace_reviewer", "commander", "auditor"}: raise ApiError(403, "investigations_forbidden", "当前角色不能读取调查单")
+        return self._investigation_view(row, full=True)
 
     def notifications(self, actor: str, role: str, operator: str) -> dict[str, Any]:
         if role == "operator":
@@ -304,11 +429,14 @@ class DroneAirspaceService:
         now = iso()
         with self.repo.tx() as conn:
             rows = list(conn.execute("SELECT * FROM flight_plans WHERE status='approved' AND ends_at<=?", (now,)))
+            expired = 0
             for row in rows:
+                if Repository.active_investigation(conn, row["id"]): continue
                 conn.execute("UPDATE flight_plans SET status='expired',updated_at=? WHERE id=?", (now, row["id"]))
                 Repository.audit(conn, row["id"], actor, role, "plan_expired", {})
                 Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期")
-        return {"expired": len(rows)}
+                expired += 1
+        return {"expired": expired}
 
     def state(self, role: str, operator: str) -> dict[str, Any]:
         conn = self.repo.conn
@@ -341,7 +469,9 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/investigations": return 200, self.service.list_investigations(role, operator)
         parts = [p for p in path.split("/") if p]
+        if len(parts) == 3 and parts[:2] == ["api", "investigations"] and parts[2].isdigit(): return 200, self.service.investigation_detail(int(parts[2]), role, operator)
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
         raise ApiError(404, "not_found", "接口不存在")
@@ -350,6 +480,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
+        if len(parts) == 4 and parts[:2] == ["api", "investigations"] and parts[2].isdigit() and parts[3] == "close":
+            return 200, self.service.close_investigation(int(parts[2]), actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             pid, action = int(parts[2]), parts[3]
             routes = {
@@ -358,6 +490,7 @@ class Handler(BaseHTTPRequestHandler):
                 "reject": lambda: self.service.reject(pid, actor, role, body),
                 "change": lambda: self.service.change(pid, actor, role, operator, body),
                 "cancel": lambda: self.service.cancel(pid, actor, role, operator, body),
+                "investigate": lambda: self.service.open_investigation(pid, actor, role, body),
             }
             if action in routes: return 200, routes[action]()
         raise ApiError(404, "not_found", "接口不存在")
