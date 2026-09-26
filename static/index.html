@@ -1,3 +1,78 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}
+pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}
+input,button,select{font:inherit;padding:8px;margin:4px}
+button{background:#4338ca;color:white;border:0;border-radius:6px;cursor:pointer}
+button.danger{background:#b91c1c}
+.card{border:1px solid #dde3ee;border-radius:10px;padding:12px 16px;margin:10px 0}
+.card.sealed{border-left:5px solid #b91c1c;background:#fef2f2}
+.card.released{border-left:5px solid #15803d;background:#f0fdf4}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-right:6px}
+.tag.sealed{background:#fee2e2;color:#991b1b}.tag.released{background:#dcfce7;color:#166534}
+small{color:#5b6678}
+label{font-size:13px;color:#33415c}
+</style>
+<h1>无人机空域协调台</h1>
+<p>查看飞行计划、空域限制与事故调查封存。封存期间运营方只能查看，任何状态改写返回 409。</p>
+<section>
+  <label>身份 <input id="u" value="commander"></label>
+  <label>角色
+    <select id="r"><option>commander</option><option>airspace_reviewer</option><option>auditor</option><option value="operator">operator</option><option>viewer</option></select>
+  </label>
+  <label>运营方(仅operator) <input id="op" value=""></label>
+  <button onclick="loadAll()">刷新</button>
+</section>
+<section>
+  <h2>事故调查封存清单</h2>
+  <p><small>展示调查清单、冻结原因与快照摘要。指挥官可开单封存或填结论解除。</small></p>
+  <div id="investigations"></div>
+</section>
+<section>
+  <h3>开立调查封存单</h3>
+  <label>计划ID <input id="sealPlan" size="6"></label>
+  <label>事故类型 <input id="sealType" value="midair_collision"></label>
+  <label>发现时间(留空=现在) <input id="sealFound" size="28"></label>
+  <label>冻结原因 <input id="sealReason" size="30" value="等待事故调查"></label>
+  <button onclick="seal()">封存</button>
+</section>
+<section><h2>系统状态</h2><pre id="o"></pre></section>
+<script>
+function headers(){return {'X-User-Id':u.value,'X-Role':r.value,'X-Operator':op.value,'Content-Type':'application/json'}}
+async function jpost(url,body){let x=await fetch(url,{method:'POST',headers:headers(),body:JSON.stringify(body)});return [x.status,await x.json()]}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function invCard(v){
+  let s=v.snapshot_summary||{};let sealed=v.status==='sealed';
+  let actions=sealed?`<button class="danger" onclick="release(${v.id})">填结论解除</button>`:'';
+  return `<div class="card ${v.status}">
+    <span class="tag ${v.status}">${sealed?'封存中':'已解除'}</span>
+    <strong>调查 #${v.id}</strong> · 计划 ${esc(v.plan&&v.plan.callsign)} (#${v.plan_id}) · 当前状态 ${esc(v.plan&&v.plan.current_status)}
+    <br><small>开单人 ${esc(v.opened_by)} · 事故类型 ${esc(v.accident_type)} · 发现时间 ${esc(v.found_at)} · 封存时间 ${esc(v.created_at)}</small>
+    <p>冻结原因：${esc(v.freeze_reason||'—')}</p>
+    <p><small>快照摘要：计划 r${s.plan&&s.plan.revision}/${esc(s.plan&&s.plan.status)}，航线点 ${s.plan&&s.plan.route_points}；审核 ${s.reviews&&s.reviews.count} 条（批准 ${s.reviews&&s.reviews.approved}）；通知 ${s.notifications&&s.notifications.count} 条；生效限制 ${s.restrictions&&s.restrictions.active_count} 个，检查可批准=${s.restrictions&&s.restrictions.approvable}，阻断冲突 ${s.restrictions&&s.restrictions.blocking_conflicts} 项。</small></p>
+    ${v.conclusion?`<p><small>解除结论：${esc(v.conclusion)}（${esc(v.released_by)} @ ${esc(v.released_at)}）</small></p>`:''}
+    ${actions}
+  </div>`
+}
+async function loadInvestigations(){
+  let x=await fetch('/api/investigations',{headers:headers()});let data=await x.json();
+  let box=document.getElementById('investigations');
+  if(x.status!==200){box.innerHTML=`<pre>${esc(data.message||data.error)}</pre>`;return}
+  box.innerHTML=(data.investigations||[]).map(invCard).join('')||'<small>暂无调查封存单</small>';
+}
+async function load(){let x=await fetch('/api/state',{headers:headers()});o.textContent=JSON.stringify(await x.json(),null,2)}
+async function loadAll(){load();loadInvestigations()}
+async function seal(){
+  let body={accident_type:sealType.value,freeze_reason:sealReason.value};
+  if(sealFound.value)body.found_at=sealFound.value;
+  let [st,data]=await jpost(`/api/plans/${Number(sealPlan.value)}/investigation/seal`,body);
+  alert(st===201?`已封存：调查 #${data.id}`:`${st} ${data.error}: ${data.message}`);loadAll();
+}
+async function release(id){
+  let conclusion=prompt('填写调查结论：');if(!conclusion)return;
+  let [st,data]=await jpost(`/api/investigations/${id}/release`,{conclusion});
+  alert(st===200?`调查 #${id} 已解除`+`${data.approval_voided?'；原批准已失效退回草稿':''}`:`${st} ${data.error}: ${data.message}`);loadAll();
+}
+loadAll()
+</script>
